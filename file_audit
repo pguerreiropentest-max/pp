@@ -1,0 +1,110 @@
+function Get-WeakServicePermissions {
+    <#
+    .SYNOPSIS
+    Audits Windows services to identify weak file or folder permissions on their executables.
+
+    .DESCRIPTION
+    This function queries all configured services, parses their executable paths, 
+    and inspects the Access Control Lists (ACLs) of both the executable and its parent directory. 
+    It flags services where unprivileged groups (e.g., Everyone, Users) have Write, Modify, or FullControl rights.
+
+    .EXAMPLE
+    Get-WeakServicePermissions | Out-GridView
+
+    .EXAMPLE
+    Get-WeakServicePermissions | Export-Csv -Path "C:\temp\VulnerableServices.csv" -NoTypeInformation
+    #>
+    [CmdletBinding()]
+    param ()
+
+    begin {
+        Write-Verbose "Initializing service audit..."
+        # Define the groups considered "unprivileged" or risky for service binaries
+        $RiskyGroups = @(
+            'Everyone', 
+            'BUILTIN\Users', 
+            'NT AUTHORITY\Authenticated Users', 
+            'NT AUTHORITY\Interactive'
+        )
+        
+        # Define the rights that allow file replacement
+        $DangerousRights = 'Write', 'Modify', 'FullControl', 'AppendData'
+        
+        $Results = @()
+    }
+
+    process {
+        # Retrieve all services with an executable path
+        $Services = Get-CimInstance -ClassName Win32_Service -Filter "PathName IS NOT NULL"
+
+        foreach ($Service in $Services) {
+            $RawPath = $Service.PathName
+            $ExePath = $null
+
+            # Parse the executable path (handles quotes and command-line arguments)
+            if ($RawPath -match '^"([^"]+)"') {
+                $ExePath = $Matches[1]
+            } elseif ($RawPath -match '^([a-zA-Z]:\\[^\s]+\.exe)') {
+                $ExePath = $Matches[1]
+            } else {
+                $ExePath = ($RawPath -split ' -')[0] # Fallback
+            }
+
+            # Remove any trailing spaces
+            $ExePath = $ExePath.Trim()
+
+            if (Test-Path -Path $ExePath -PathType Leaf) {
+                
+                $TargetsToCheck = @(
+                    [PSCustomObject]@{ Type = 'File'; Path = $ExePath },
+                    [PSCustomObject]@{ Type = 'Folder'; Path = (Split-Path $ExePath -Parent) }
+                )
+
+                foreach ($Target in $TargetsToCheck) {
+                    try {
+                        # Retrieve the ACL
+                        $Acl = Get-Acl -Path $Target.Path -ErrorAction Stop
+
+                        foreach ($AccessRule in $Acl.Access) {
+                            $Identity = $AccessRule.IdentityReference.Value
+                            $Rights = $AccessRule.FileSystemRights
+
+                            # Check if the identity is in our risky groups list
+                            if ($RiskyGroups -contains $Identity) {
+                                
+                                # Check if the rights contain dangerous permissions
+                                $IsVulnerable = $false
+                                foreach ($DangerousRight in $DangerousRights) {
+                                    if ($Rights -match $DangerousRight -and $AccessRule.AccessControlType -eq 'Allow') {
+                                        $IsVulnerable = $true
+                                        break
+                                    }
+                                }
+
+                                if ($IsVulnerable) {
+                                    $Results += [PSCustomObject]@{
+                                        ServiceName  = $Service.Name
+                                        DisplayName  = $Service.DisplayName
+                                        StartMode    = $Service.StartMode
+                                        TargetType   = $Target.Type
+                                        VulnerablePath = $Target.Path
+                                        RiskyGroup   = $Identity
+                                        Permissions  = $Rights
+                                    }
+                                }
+                            }
+                        }
+                    } catch {
+                        Write-Verbose "Skipped $($Target.Path): Permission Denied or Not Found."
+                    }
+                }
+            }
+        }
+    }
+
+    end {
+        Write-Verbose "Audit complete. Found $($Results.Count) potential misconfigurations."
+        # Return unique results (a file/folder might match multiple risky groups)
+        return $Results | Select-Object -Unique *
+    }
+}
