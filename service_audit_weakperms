@@ -1,0 +1,22 @@
+# Get all services on the system
+$services = Get-Service
+
+Write-Host "Auditing Services for Weak Permissions (SERVICE_CHANGE_CONFIG)..." -ForegroundColor Cyan
+
+foreach ($service in $services) {
+    # Suppress errors for services we don't have read access to
+    $sddl = (sc.exe sdshow $service.Name 2>$null) -join ""
+    
+    # Regex breakdown:
+    # \(A;      -> Access Allowed
+    # [^;]*DC   -> Contains 'DC' (SERVICE_CHANGE_CONFIG) in the rights section
+    # [^;]*;;;  -> Ignores the next few fields until the Account SID
+    # (BU|AU|IU|WD) -> Looks for Standard User SIDs
+    
+    if ($sddl -match "\(A;;[^;]*DC[^;]*;;;(BU|AU|IU|WD)\)") {
+        Write-Host "[!] Vulnerable Service Found: $($service.Name)" -ForegroundColor Red
+        Write-Host "    Display Name: $($service.DisplayName)"
+        Write-Host "    SDDL: $sddl"
+        Write-Host "---------------------------------------------------"
+    }
+}
